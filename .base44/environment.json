@@ -1,0 +1,12 @@
+{
+  "previewPort": 3000,
+  "healthPath": "/_stcore/health",
+  "startCommand": "docker compose -f docker-compose.base44.yml up -d",
+  "secrets": [
+    {
+      "name": "GEMINI_API_KEY",
+      "description": "Google Gemini API key for AI prescription analysis. Get it from Google AI Studio (https://aistudio.google.com/apikey). Optional — the app boots without it but the AI analysis feature won't work until it's provided. You can also enter it directly in the app's sidebar.",
+      "requiredAtBoot": false
+    }
+  ]
+}

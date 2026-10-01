@@ -1,0 +1,26 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.base44
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+    env_file:
+      - /run/base44/app.env
+    command: >
+      streamlit run app.py
+      --server.port=3000
+      --server.address=0.0.0.0
+      --server.headless=true
+      --server.enableCORS=false
+      --server.enableXsrfProtection=false
+      --browser.gatherUsageStats=false
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/_stcore/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 5

@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+# System dependencies: Tesseract OCR engine + OpenCV runtime libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    libgl1 \
+    libglib2.0-0 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install torch/torchvision from CPU-only index (much smaller than default CUDA wheels)
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.1.0 torchvision==0.16.0
+
+# Install remaining Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download NLTK data so first page load is faster
+RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('stopwords', quiet=True); nltk.download('wordnet', quiet=True)"
+
+EXPOSE 3000
