@@ -15,12 +15,22 @@ from sklearn.metrics.pairwise import cosine_similarity
 import requests
 from bs4 import BeautifulSoup
 from config import Config
+from medicine_verifier import MedicineVerifier
 
 class PrescriptionAnalyzer:
     def __init__(self):
         self.config = Config()
         self.gemini_model = self.config.setup_gemini()
         self.setup_nlp()
+        self.verifier = self._load_verifier()
+
+    def _load_verifier(self):
+        """Load the local medicine-name database (verification is optional)."""
+        try:
+            return MedicineVerifier()
+        except Exception as e:
+            print(f"Warning: medicine database unavailable: {e}")
+            return None
         
     def setup_nlp(self):
         """Initialize NLP components"""
@@ -226,6 +236,12 @@ class PrescriptionAnalyzer:
             'gemini_analysis': self.analyze_with_gemini(extracted_text)
         }
         
+        # Verify each recognized name against the local medicine database
+        results['drug_verification'] = (
+            [self.verifier.verify(drug) for drug in results['recognized_drugs']]
+            if self.verifier else []
+        )
+
         # Add e-commerce links
         results['ecommerce_links'] = self.get_ecommerce_links(results['recognized_drugs'])
         

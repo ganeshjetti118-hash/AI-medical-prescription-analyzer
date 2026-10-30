@@ -23,7 +23,25 @@ The app is served on port 3000. Health check: `/_stcore/health`.
 - `app.py` — Streamlit UI
 - `config.py` — Configuration (API keys, drug patterns, e-commerce sites)
 - `prescription_analyzer.py` — Core analysis logic (OCR, NER, drug recognition, Gemini)
+- `medicine_verifier.py` — Local medicine-name verification (exact / equivalent / phonetic / spelling)
+- `data/medicine_names.csv` — 8.2k names from the FDA Orange Book (public domain)
+- `data/inn_aliases.csv` — curated INN→USAN pairs (paracetamol→acetaminophen, …)
+- `scripts/build_medicine_db.py` — rebuilds the name database from the Orange Book
 - `setup_colab.py` — Google Colab setup script (not used in Docker)
+
+## Medicine verification
+- Runs fully locally: `MedicineVerifier` loads `data/medicine_names.csv` and
+  matches on normalized exact name, known INN/USAN alias, Metaphone (jellyfish)
+  and character similarity (rapidfuzz). No name or image leaves the machine.
+- The Orange Book covers US generic/brand names only, so Indian brands (Dolo,
+  Crocin) are reported as "no match" and must be confirmed by the user.
+- Rebuild the database with
+  `docker compose -f docker-compose.base44.yml exec -T web python scripts/build_medicine_db.py`
+  (needs a browser User-Agent; the FDA blocks default agents).
+- Test the matcher directly:
+  `docker compose -f docker-compose.base44.yml exec -T web python -c "from medicine_verifier import MedicineVerifier; v=MedicineVerifier(); print(v.verify('paracetamol'))"`
+- `pyarrow` is pinned to 14.0.1: newer releases need NumPy 2, but this project
+  pins NumPy 1.24.3.
 
 ## Secrets
 - `GEMINI_API_KEY` — Google Gemini API key. Optional for boot (config.py has a default
