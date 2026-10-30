@@ -13,10 +13,12 @@ class Config:
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'your_gemini_api_key_here')
     
     # Configure Google Gemini
+    # Gemini model (override with GEMINI_MODEL)
+    GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
     @staticmethod
     def setup_gemini():
         genai.configure(api_key=Config.GEMINI_API_KEY)
-        return genai.GenerativeModel('gemini-pro')
+        return genai.GenerativeModel(Config.GEMINI_MODEL)
     
     # Drug validation patterns
     DOSAGE_PATTERNS = [

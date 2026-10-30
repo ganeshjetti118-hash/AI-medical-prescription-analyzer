@@ -30,6 +30,12 @@ The app is served on port 3000. Health check: `/_stcore/health`.
   placeholder); required for the AI analysis feature. Can also be entered in the app sidebar.
 
 ## Notes
+- Streamlit must run with `--server.enableCORS=false` (and XSRF protection off) in the
+  Base44 preview: the preview iframe's origin (the public `3000-...` host) is not in
+  Streamlit's allowed-origins list, so without it the WebSocket handshake is rejected
+  and the page hangs on "Please wait...".
+- `config.py` uses model `gemini-2.5-flash` (override with `GEMINI_MODEL`). The original
+  `gemini-pro` name is retired and returns a 404 from the Gemini API.
 - Torch is installed from the CPU-only PyTorch index to keep the image smaller.
 - The biomedical NER model (~400MB) downloads on first page load from HuggingFace.
   If it fails, the app continues with NER disabled (graceful degradation).
