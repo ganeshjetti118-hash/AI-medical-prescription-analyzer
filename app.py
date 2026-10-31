@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 import json
-from prescription_analyzer import PrescriptionAnalyzer
+from prescription_analyzer import PrescriptionAnalyzer, build_search_query
 
 # Page configuration
 st.set_page_config(
@@ -53,6 +53,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+MATCH_LABELS = {
+    'exact': 'official name',
+    'alias': 'equivalent name',
+    'known-brand': 'known brand',
+    'phonetic': 'same pronunciation',
+    'spelling': 'similar spelling',
+}
+
 @st.cache_resource
 def load_analyzer():
     """Load the prescription analyzer (cached for performance)"""
@@ -90,6 +98,9 @@ def main():
         analyzer.config.GEMINI_API_KEY = api_key_input
         analyzer.gemini_model = analyzer.config.setup_gemini()
         st.sidebar.success("✅ API Key Updated")
+    
+    # Confirmed medicines, reused by the e-pharmacy section
+    confirmed_items = []
     
     # Main content
     col1, col2 = st.columns([1, 1])
@@ -132,57 +143,63 @@ def main():
         st.markdown('<h2 class="sub-header">📊 Analysis Results</h2>', unsafe_allow_html=True)
         
         if prescription_data:
-            confirmed_drugs = []
-
             # Display extracted text
             with st.expander("📄 Extracted Text", expanded=False):
                 st.text_area("Raw Text:", prescription_data['extracted_text'], height=100, disabled=True)
             
-            # Display recognized drugs with local database verification
+            # Display recognized drugs with corrected official names
             st.markdown("### 💊 Recognized Medications")
-            verifications = prescription_data.get('drug_verification') or []
-            if prescription_data['recognized_drugs']:
-                for i, drug in enumerate(prescription_data['recognized_drugs'], 1):
-                    st.markdown(f'<div class="drug-card"><strong>{i}. {drug.title()}</strong></div>', unsafe_allow_html=True)
-                    verification = verifications[i - 1] if i - 1 < len(verifications) else None
-                    if not verification:
-                        confirmed_drugs.append(drug)
-                        continue
-                    exact = verification.get('exact_match')
-                    candidates = verification.get('candidates') or []
-                    if exact:
-                        st.success(f"✅ Exact match in medicine database: **{exact['name']}** ({exact['type']})")
-                        confirmed_drugs.append(exact['name'])
-                        continue
-                    suggestions = [c for c in candidates if c['name'].lower() != drug.lower()]
-                    if suggestions:
-                        st.warning("No exact match — closest names by spelling and pronunciation:")
-                        match_labels = {
-                            'alias': 'equivalent name',
-                            'phonetic': 'same pronunciation',
-                            'spelling': 'similar spelling',
-                            'exact': 'exact',
-                        }
-                        labels = [
-                            f"{c['name']} · {match_labels.get(c['match_type'], c['match_type'])} · {int(round(c['score'] * 100))}%"
-                            for c in suggestions
+            medicines = prescription_data.get('medicines') or []
+            if medicines:
+                for i, medicine in enumerate(medicines, 1):
+                    raw_name = medicine['raw_name']
+                    official_name = medicine['name']
+                    heading_name = raw_name if medicine['needs_confirmation'] else official_name
+                    heading = heading_name + (f" · {medicine['dosage']}" if medicine.get('dosage') else "")
+                    st.markdown(f'<div class="drug-card"><strong>{i}. {heading}</strong></div>', unsafe_allow_html=True)
+                    if medicine.get('frequency'):
+                        st.caption(f"Frequency: {medicine['frequency']}")
+                    
+                    match_label = MATCH_LABELS.get(medicine['match_type'], medicine['match_type'])
+                    score_pct = int(round(medicine['score'] * 100))
+                    
+                    chosen_name = official_name
+                    if medicine['match_type'] == 'exact':
+                        st.success(f"✅ Official name in medicine database: **{official_name}** ({medicine['type']})")
+                    elif not medicine['needs_confirmation']:
+                        st.success(f"✅ Corrected **{raw_name}** → **{official_name}** ({match_label}, {score_pct}%)")
+                    elif medicine['candidates']:
+                        st.warning(f"No confident match for **{raw_name}** — closest names by spelling and pronunciation:")
+                        options = [
+                            f"{c['name']} · {MATCH_LABELS.get(c['match_type'], c['match_type'])} · {int(round(c['score'] * 100))}%"
+                            for c in medicine['candidates']
                         ]
-                        keep = f"Keep as written: {drug}"
+                        keep_raw = f"Keep as written: {raw_name}"
                         choice = st.selectbox(
                             "Confirm this medicine:",
-                            labels + [keep],
+                            options + [keep_raw],
+                            index=len(options),
                             key=f"confirm_drug_{i}",
                             help="Database matches help with spelling only; they do not confirm the prescription.",
                         )
-                        if choice == keep:
-                            confirmed_drugs.append(drug)
+                        if choice != keep_raw:
+                            chosen_name = medicine['candidates'][options.index(choice)]['name']
                         else:
-                            confirmed_drugs.append(suggestions[labels.index(choice)]['name'])
+                            chosen_name = raw_name
                     else:
                         st.error("No match in the local medicine database — please confirm this name.")
-                        confirmed_drugs.append(drug)
-                if verifications:
-                    st.caption("Database matches are a spelling aid only — not clinical validation.")
+                        chosen_name = raw_name
+                    
+                    search_query = build_search_query(chosen_name, medicine.get('dosage', ''))
+                    st.caption(f"Search string for e-pharmacy links: `{search_query}`")
+                    
+                    if search_query and search_query.lower() not in [item['search_query'].lower() for item in confirmed_items]:
+                        confirmed_items.append({
+                            'name': chosen_name,
+                            'dosage': medicine.get('dosage', ''),
+                            'search_query': search_query,
+                        })
+                st.caption("Database matches are a spelling aid only — not clinical validation.")
             else:
                 st.warning("No medications recognized. Please check the image quality or text.")
             
@@ -222,24 +239,29 @@ def main():
                     st.error("AI analysis failed. Please check your API key configuration.")
     
     # E-commerce section (full width)
-    if prescription_data and confirmed_drugs:
+    if prescription_data and confirmed_items:
         st.markdown("---")
         st.markdown('<h2 class="sub-header">🛒 Order Medications Online</h2>', unsafe_allow_html=True)
         
-        # Create tabs for each confirmed drug
-        ecommerce_links_by_drug = analyzer.get_ecommerce_links(confirmed_drugs)
-        drug_tabs = st.tabs([f"💊 {drug.title()}" for drug in confirmed_drugs])
+        # Links are built from the corrected, e-pharmacy-ready search strings
+        ecommerce_links_by_query = analyzer.get_ecommerce_links(confirmed_items)
+        tab_labels = [
+            f"💊 {item['name']}" + (f" {item['dosage']}" if item['dosage'] else "")
+            for item in confirmed_items
+        ]
+        drug_tabs = st.tabs(tab_labels)
         
-        for i, (drug, tab) in enumerate(zip(confirmed_drugs, drug_tabs)):
+        for item, tab in zip(confirmed_items, drug_tabs):
             with tab:
-                st.markdown(f"### Order {drug.title()} from:")
+                st.markdown(f"### Order {item['name']} from:")
+                st.caption(f"Search: `{item['search_query']}`")
                 
-                ecommerce_links = ecommerce_links_by_drug[drug]
+                ecommerce_links = ecommerce_links_by_query.get(item['search_query'], [])
                 
                 # Create columns for e-commerce sites
-                cols = st.columns(len(ecommerce_links))
+                cols = st.columns(len(ecommerce_links)) if ecommerce_links else []
                 
-                for j, (link_info, col) in enumerate(zip(ecommerce_links, cols)):
+                for link_info, col in zip(ecommerce_links, cols):
                     with col:
                         st.markdown(f"""
                         <div style="text-align: center; padding: 1rem; border: 2px solid #ddd; border-radius: 10px; margin: 0.5rem;">

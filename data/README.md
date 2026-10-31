@@ -38,8 +38,10 @@ other markets to the US name held in the Orange Book (e.g. `paracetamol` →
 
 - **Source:** curated by hand from WHO INN listings and standard pharmacopoeial
   naming; 27 pairs covering the most common prescription generics.
-- **Behaviour:** an alias hit is shown as an *equivalent name* (98% score), not
-  as an exact string match, and still asks the user to confirm.
+- **Behaviour:** an alias hit returns the INN spelling used on the prescription
+  (e.g. `Paracetamol`) with the US name kept as `equivalent`
+  (`ACETAMINOPHEN`), scored 0.98. It clears the auto-correct threshold, so the
+  search string uses the term the Indian e-pharmacies index.
 - Extend the file with more `inn,usan` rows; rows whose US name is absent from
   `medicine_names.csv` are ignored at load time.
 

@@ -14,8 +14,53 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import quote
 from config import Config
-from medicine_verifier import MedicineVerifier
+from medicine_verifier import MedicineVerifier, STOP_TOKENS, normalize_name
+
+# Prescribed strength, e.g. "500 mg", "0.5 gm", "5 ml"
+DOSAGE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|gm|ml|units?|i\.?u\.?)\b", re.IGNORECASE)
+# Bare strength used by Indian brands, e.g. "Dolo 650" (but not "x 5 days")
+BARE_DOSAGE_RE = re.compile(r"\b(\d{2,4})\b(?!\s*(?:days?|weeks?|months?|times?|hrs?|hours?|%))")
+NAME_WORD_RE = re.compile(r"[A-Za-z][A-Za-z\-]{2,}")
+DRUG_STEM_RE = re.compile(
+    r"\b[A-Za-z]+(?:cillin|mycin|prazole|statin|dipine|formin|olol|azepam|oxetine|"
+    r"profen|floxacin|conazole|tidine|ciclovir|sartan|dronate|gliptin|gliflozin|triptan)\b",
+    re.IGNORECASE)
+NAME_AFTER_FORM_RE = re.compile(
+    r"\b(?:tab|cap|syp|susp|inj|oint|cream)\b\.?\s+([A-Za-z][A-Za-z\-]{2,}(?:\s+[A-Za-z][A-Za-z\-]{2,})?)",
+    re.IGNORECASE)
+# Words that are never part of a medicine name on a prescription line
+LINE_NOISE = STOP_TOKENS | {
+    "take", "taken", "use", "used", "apply", "twice", "thrice", "once", "daily",
+    "day", "days", "week", "weeks", "month", "months", "after", "before", "food",
+    "meals", "meal", "morning", "evening", "night", "empty", "stomach", "each",
+    "every", "hour", "hours", "then", "the", "for", "with", "from", "when",
+    "needed", "continue", "stop", "review", "follow", "advice", "advised",
+    "doctor", "patient", "date", "signature", "diagnosis", "x", "name", "age",
+    "sex", "weight", "address", "clinic", "hospital", "mbbs", "reg", "phone",
+    "mobile", "sign", "complaint", "history",
+}
+
+# Dosing abbreviations commonly written on Indian prescriptions
+FREQUENCY_ABBREVIATIONS = ("tds", "tid", "bds", "bd", "od", "hs", "qid", "qds",
+                           "sos", "prn", "stat", "qam", "qhs", "qod")
+FREQUENCY_ABBREVIATION_RE = re.compile(
+    r"\b(" + "|".join(FREQUENCY_ABBREVIATIONS) + r")\b", re.IGNORECASE)
+DIRECTIVE_RE = re.compile(
+    r"^\s*(?:avoid|do not|don't|not|stop|discontinue|continue|follow|review|"
+    r"advised|advice|apply|take|use)\b", re.IGNORECASE)
+DOSAGE_FORM_RE = re.compile(
+    r"\b(?:tab|tablet|cap|capsule|syp|syrup|susp|suspension|inj|injection|"
+    r"oint|ointment|cream|drop|drops|inhaler|respules)\b", re.IGNORECASE)
+
+
+def build_search_query(name, dosage=""):
+    """Clean string for an e-pharmacy search box: official name plus strength."""
+    parts = [part for part in (name, dosage) if part]
+    query = re.sub(r"[^\w\s\.\-/]", " ", " ".join(parts))
+    return re.sub(r"\s+", " ", query).strip()
+
 
 class PrescriptionAnalyzer:
     def __init__(self):
@@ -84,56 +129,213 @@ class PrescriptionAnalyzer:
             return text.strip()
         except Exception as e:
             return f"Error in text extraction: {str(e)}"
-    
+
+    def extract_medicines(self, text):
+        """
+        Extract medicines with their dosage and frequency, correcting every
+        name against the local database (Levenshtein distance).
+
+        Returns one dict per prescription line, each with the raw string, the
+        official name, and a clean search string for e-pharmacy URLs.
+        """
+        medicines = []
+        for line in (text or "").splitlines():
+            entry = self._parse_medicine_line(line)
+            if entry:
+                medicines.append(entry)
+        return medicines
+
+    def _parse_medicine_line(self, line):
+        """Read one prescription line into a corrected medicine record."""
+        text = (line or "").strip()
+        if len(text) < 3:
+            return None
+        dosage = self._extract_dosage(text)
+        # Instruction lines ("Avoid alcohol", "Follow up after 5 days")
+        if DIRECTIVE_RE.match(text) and not dosage and not DRUG_STEM_RE.search(text):
+            return None
+        raw_name, verification = self._best_name(text)
+        if not raw_name:
+            return None
+        record = self._correct_name(raw_name, verification)
+        if not self._looks_prescribed(text, record, dosage):
+            return None
+        record.update({
+            "raw_line": text,
+            "dosage": dosage,
+            "frequency": self._extract_frequency(text),
+        })
+        record["search_query"] = build_search_query(record["name"], dosage)
+        return record
+
+    def _looks_prescribed(self, text, record, dosage):
+        """Reject prose lines that merely resemble a medicine name."""
+        if dosage or DOSAGE_FORM_RE.search(text) or DRUG_STEM_RE.search(text):
+            return True
+        if record["match_type"] in ("exact", "known-brand"):
+            return True
+        return record["score"] >= self.verifier.AUTO_CORRECT_SCORE if self.verifier else False
+
+    def _best_name(self, text):
+        """Longest, best-scoring name span on the line (Levenshtein cross-check)."""
+        tokens = [token for token in NAME_WORD_RE.findall(text) if token.lower() not in LINE_NOISE]
+        if not tokens:
+            return None, None
+        if not self.verifier:
+            stem = next((token for token in tokens if DRUG_STEM_RE.match(token)), None)
+            return (stem or tokens[0]), None
+
+        best_span, best_verification = None, None
+        for start in range(len(tokens)):
+            for size in (1, 2, 3, 4):
+                span = " ".join(tokens[start:start + size])
+                if len(span) < 4:
+                    continue
+                verification = self.verifier.verify(span)
+                if best_verification is None:
+                    best_span, best_verification = span, verification
+                    continue
+                if verification["score"] > best_verification["score"] + 1e-9:
+                    best_span, best_verification = span, verification
+                elif abs(verification["score"] - best_verification["score"]) < 1e-9 and len(span) > len(best_span):
+                    best_span, best_verification = span, verification
+        if best_verification["score"] >= self.verifier.MIN_SCORE:
+            return best_span, best_verification
+
+        # No database match: fall back to prescription heuristics
+        stem = next((token for token in tokens if DRUG_STEM_RE.match(token)), None)
+        if stem:
+            return stem, None
+        after_form = NAME_AFTER_FORM_RE.search(text)
+        if after_form:
+            return after_form.group(1).strip(), None
+        if self._extract_dosage(text):
+            return tokens[0], None
+        return None, None
+
+    @staticmethod
+    def _pretty(name):
+        """Title-case names stored in all caps or all lower case."""
+        if not name:
+            return name
+        if not (name.isupper() or name.islower()):
+            return name
+        pretty = name.title()
+        return re.sub(r"\b(And|Of|The|With)\b", lambda m: m.group(1).lower(), pretty)
+
+    def _correct_name(self, raw_name, verification=None):
+        """Correct one raw name to its official generic or brand name."""
+        record = {
+            "raw_name": raw_name,
+            "name": raw_name,
+            "type": "unknown",
+            "match_type": "none",
+            "score": 0.0,
+            "confidence": "low",
+            "needs_confirmation": True,
+            "candidates": [],
+        }
+        # Curated brand -> generic pairs win over fuzzy guesses (Dolo, Crocin)
+        known_brand = self._known_brand_generic(raw_name, brands_only=True)
+        if known_brand:
+            record.update({
+                "name": known_brand,
+                "type": "generic",
+                "match_type": "known-brand",
+                "score": 0.95,
+                "confidence": "high",
+                "needs_confirmation": False,
+            })
+            return record
+
+        if self.verifier:
+            verification = verification or self.verifier.verify(raw_name)
+            record["candidates"] = [
+                dict(candidate, name=self._pretty(candidate["name"]))
+                for candidate in verification["candidates"]
+            ]
+            record["score"] = verification["score"]
+            record["match_type"] = verification["match_type"]
+            record["confidence"] = verification["confidence"]
+            record["needs_confirmation"] = verification["needs_confirmation"]
+            if record["candidates"]:
+                record["name"] = record["candidates"][0]["name"]
+                record["type"] = record["candidates"][0]["type"]
+            if verification["auto_corrected"]:
+                return record
+
+        # Curated Indian/global brand -> generic map (brands outside the FDA list)
+        known = self._known_brand_generic(raw_name)
+        if known:
+            record.update({
+                "name": known,
+                "type": "generic",
+                "match_type": "known-brand",
+                "score": 0.95,
+                "confidence": "high",
+                "needs_confirmation": False,
+            })
+        return record
+
+    def _known_brand_generic(self, raw_name, brands_only=False):
+        """Look up a brand (or generic) name in the curated brand -> generic map."""
+        norm = normalize_name(raw_name)
+        if not norm:
+            return None
+        for generic, brands in self.config.COMMON_DRUGS.items():
+            if norm in {normalize_name(brand) for brand in brands}:
+                return generic.title()
+            if not brands_only and norm == normalize_name(generic):
+                return generic.title()
+        return None
+
+    def _extract_dosage(self, text):
+        """Strength on the line, e.g. "500 mg" or a bare "650"."""
+        match = DOSAGE_RE.search(text)
+        if match:
+            return f"{match.group(1)} {match.group(2).lower()}"
+        match = BARE_DOSAGE_RE.search(text)
+        return match.group(1) if match else ""
+
+    def _extract_frequency(self, text):
+        """First recognised dosing frequency on the line."""
+        match = FREQUENCY_ABBREVIATION_RE.search(text)
+        if match:
+            return match.group(0).upper()
+        for pattern in self.config.FREQUENCY_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                found = match.group(0).strip()
+                return found.upper() if len(found) <= 4 else found.title()
+        return ""
+
     def recognize_and_standardize_drugs(self, text):
-        """Recognize and standardize drug names"""
-        recognized_drugs = []
-        text_lower = text.lower()
-        
-        # Pattern matching for drug names
-        drug_patterns = [
-            r'\b[A-Za-z]+(?:cillin|mycin|prazole|statin|dipine|formin)\b',
-            r'\b(?:tab|cap|syp|inj)[\s\.]*([A-Za-z]+(?:\s+[A-Za-z]+)?)\b',
-            r'\b([A-Za-z]{3,})\s+\d+\s*(?:mg|g|ml|mcg)\b'
-        ]
-        
-        for pattern in drug_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    match = match[0] if match[0] else match[1]
-                if len(match) > 2:
-                    recognized_drugs.append(match.lower().strip())
-        
-        # Standardize using common drug database
-        standardized_drugs = []
-        for drug in recognized_drugs:
-            standardized = self.standardize_drug_name(drug)
-            if standardized and standardized not in standardized_drugs:
-                standardized_drugs.append(standardized)
-        
-        return standardized_drugs
-    
+        """Recognize medicines and return their official (corrected) names."""
+        names = self._unique_names(self.extract_medicines(text))
+        seen = {name.lower() for name in names}
+        # Catch names the line parser missed (e.g. several drugs on one line)
+        for match in DRUG_STEM_RE.finditer(text or ""):
+            corrected = self.standardize_drug_name(match.group(0))
+            if corrected and corrected.lower() not in seen:
+                seen.add(corrected.lower())
+                names.append(corrected)
+        return names
+
     def standardize_drug_name(self, drug_name):
-        """Standardize drug name using database lookup"""
-        drug_lower = drug_name.lower().strip()
-        
-        # Direct match
-        if drug_lower in self.config.COMMON_DRUGS:
-            return drug_lower
-        
-        # Check synonyms
-        for standard_name, synonyms in self.config.COMMON_DRUGS.items():
-            if drug_lower in synonyms:
-                return standard_name
-        
-        # Partial matching for complex names
-        for standard_name, synonyms in self.config.COMMON_DRUGS.items():
-            if any(syn in drug_lower or drug_lower in syn for syn in [standard_name] + synonyms):
-                return standard_name
-        
-        return drug_name  # Return original if no match found
-    
+        """Correct one raw drug string to its official generic or brand name."""
+        return self._correct_name((drug_name or "").strip())["name"]
+
+    @staticmethod
+    def _unique_names(medicines):
+        """Distinct official names, in prescription order."""
+        names, seen = [], set()
+        for medicine in medicines:
+            key = medicine["name"].lower()
+            if key not in seen:
+                seen.add(key)
+                names.append(medicine["name"])
+        return names
+
     def validate_dosage_and_frequency(self, text):
         """Extract and validate dosage and frequency information"""
         dosages = []
@@ -197,19 +399,23 @@ class PrescriptionAnalyzer:
             print(f"NER extraction error: {e}")
             return []
     
-    def get_ecommerce_links(self, drug_names):
-        """Generate e-commerce links for ordering medications"""
+    def get_ecommerce_links(self, medicines):
+        """E-pharmacy search links built from each medicine's clean search string."""
         ecommerce_links = {}
         
-        for drug in drug_names:
-            drug_links = []
-            for site in self.config.MEDICAL_ECOMMERCE_SITES:
-                search_url = site['search_url'].format(drug.replace(' ', '%20'))
-                drug_links.append({
+        for medicine in medicines:
+            query = medicine.get('search_query') if isinstance(medicine, dict) else medicine
+            query = (query or '').strip()
+            if not query or query in ecommerce_links:
+                continue
+            encoded = quote(query, safe='')
+            ecommerce_links[query] = [
+                {
                     'site_name': site['name'],
-                    'url': search_url
-                })
-            ecommerce_links[drug] = drug_links
+                    'url': site['search_url'].format(encoded)
+                }
+                for site in self.config.MEDICAL_ECOMMERCE_SITES
+            ]
         
         return ecommerce_links
     
@@ -227,22 +433,32 @@ class PrescriptionAnalyzer:
         else:
             extracted_text = text_or_image
         
+        # Corrected medicines: official name, dosage, clean search string
+        medicines = self.extract_medicines(extracted_text)
+        
         # Perform analysis
         results = {
             'extracted_text': extracted_text,
-            'recognized_drugs': self.recognize_and_standardize_drugs(extracted_text),
+            'medicines': medicines,
+            'recognized_drugs': self._unique_names(medicines),
             'dosage_frequency': self.validate_dosage_and_frequency(extracted_text),
             'medical_entities': self.extract_medical_entities(extracted_text),
             'gemini_analysis': self.analyze_with_gemini(extracted_text)
         }
         
-        # Verify each recognized name against the local medicine database
-        results['drug_verification'] = (
-            [self.verifier.verify(drug) for drug in results['recognized_drugs']]
-            if self.verifier else []
-        )
+        # Verification detail per medicine (kept for callers of the old shape)
+        results['drug_verification'] = [
+            {
+                'input': medicine['raw_name'],
+                'candidates': medicine['candidates'],
+                'confidence': medicine['confidence'],
+                'needs_confirmation': medicine['needs_confirmation'],
+                'phonetic_match': any(c['match_type'] == 'phonetic' for c in medicine['candidates']),
+            }
+            for medicine in medicines
+        ]
 
         # Add e-commerce links
-        results['ecommerce_links'] = self.get_ecommerce_links(results['recognized_drugs'])
+        results['ecommerce_links'] = self.get_ecommerce_links(medicines)
         
         return results

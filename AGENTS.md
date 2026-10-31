@@ -32,9 +32,25 @@ The app is served on port 3000. Health check: `/_stcore/health`.
 ## Medicine verification
 - Runs fully locally: `MedicineVerifier` loads `data/medicine_names.csv` and
   matches on normalized exact name, known INN/USAN alias, Metaphone (jellyfish)
-  and character similarity (rapidfuzz). No name or image leaves the machine.
-- The Orange Book covers US generic/brand names only, so Indian brands (Dolo,
-  Crocin) are reported as "no match" and must be confirmed by the user.
+  and **normalized Levenshtein distance** (blended with `fuzz.WRatio`, pure-Python
+  fallback when rapidfuzz is missing). No name or image leaves the machine.
+- Scoring: a candidate is auto-corrected at >= 0.90 (`AUTO_CORRECT_SCORE`),
+  shown as a suggestion from 0.68 (`MIN_CANDIDATE_SCORE`), and an official
+  generic is preferred over a brand when the two are within 0.05. A name that is
+  a gappy prefix of a longer database name (OCR dropped characters, e.g.
+  `Amoxcln` -> `Amoxicillin`) is re-scored by how much of the name survived.
+- `PrescriptionAnalyzer.extract_medicines(text)` is the main entry point: one
+  record per prescription line with `raw_name`, corrected `name`, `type`,
+  `dosage`, `frequency`, `match_type`, `score`, `needs_confirmation`, and a
+  `search_query` (official name + strength) ready for e-pharmacy URLs.
+  `get_ecommerce_links()` builds the URLs from that string with `quote()`.
+- `Config.COMMON_DRUGS` supplies curated brand -> generic pairs for brands the
+  FDA list does not carry (Dolo/Crocin -> Paracetamol, Augmentin -> Amoxicillin);
+  they are reported as `known-brand` and applied when the database has no
+  confident match.
+- The Orange Book covers US generic/brand names only, so other Indian brands
+  (Panadol, Zerodol) still surface as low-confidence candidates or "no match"
+  and must be confirmed by the user.
 - Rebuild the database with
   `docker compose -f docker-compose.base44.yml exec -T web python scripts/build_medicine_db.py`
   (needs a browser User-Agent; the FDA blocks default agents).
