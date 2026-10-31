@@ -199,7 +199,7 @@ class PrescriptionAnalyzer:
                     best_span, best_verification = span, verification
                 elif abs(verification["score"] - best_verification["score"]) < 1e-9 and len(span) > len(best_span):
                     best_span, best_verification = span, verification
-        if best_verification["score"] >= self.verifier.MIN_SCORE:
+        if best_verification and best_verification["score"] >= self.verifier.MIN_SCORE:
             return best_span, best_verification
 
         # No database match: fall back to prescription heuristics
